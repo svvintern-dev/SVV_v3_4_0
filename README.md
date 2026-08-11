@@ -55,7 +55,7 @@ The application currently displays **153 variants** with per-variant patient cou
 
 - ✅ **Interactive Genome Browser**: Embedded IGV displaying variants on chromosome 6
 - ✅ **ClinVar Reference Track**: Toggleable track showing all SYNGAP1 ClinVar submissions, fetched live from NCBI and cached for 7 days; always pinned as the lowest track in the browser; variant size filterable via a log-spaced slider (1–50,000 KB, default 100 KB)
-- ✅ **Multiple Variant Types**: Missense, nonsense, frameshift, indel, intronic, structural, and VUS (missense only) variants
+- ✅ **Multiple Variant Types**: Missense, nonsense, frameshift, indel, splice VUS, CNV, and other variants
 - ✅ **Dynamic Track Loading**: Add/remove variant tracks by type
 - ✅ **Color-Coded Display**: Each variant type has a distinct color for easy identification
 - ✅ **Smart Filtering**: Filter variants by available research resources
@@ -94,7 +94,7 @@ Each variant shows:
 ### Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/cmcneil-02/syngap1-variant-viewer.git
+git clone https://github.com/svv.intern.dev/SVV_v3_4_0
 cd syngap1-variant-viewer
 ```
 

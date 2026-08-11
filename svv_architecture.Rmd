@@ -1,0 +1,995 @@
+---
+author: Collin McNeil
+output: html_document
+---
+
+# App Architecture Guide: Understanding the SYNGAP1 Variant Viewer
+
+## Table of Contents
+1. [Big Picture Overview](#big-picture-overview)
+2. [Design Philosophy](#design-philosophy)
+3. [Data Flow Diagram](#data-flow-diagram)
+4. [Component Breakdown](#component-breakdown)
+5. [Key Design Decisions](#key-design-decisions)
+6. [Development Timeline (How the App Was Built)](#development-timeline)
+7. [Common Patterns Used](#common-patterns-used)
+
+---
+
+## Big Picture Overview
+
+### What Problem Does This App Solve?
+
+**Problem:**
+Clinical geneticists have identified 153 SYNGAP1 gene variants across patient populations, but:
+- Variant data is scattered across spreadsheets
+- Hard to visualize variant locations on the gene
+- No easy way to find variants with research resources (biosamples, cell lines, mouse models)
+- cDNA notation is relative to transcript, but visualization requires genome coordinates
+
+**Solution:**
+An interactive web app that:
+1. Displays all variants on an actual genome browser (IGV)
+2. Groups variants by type (missense, nonsense, frameshift, etc.)
+3. Filters by available research resources
+4. Automatically converts cDNA coordinates to genome positions
+5. Runs in any web browser (no installation for end users)
+
+---
+
+## Design Philosophy
+
+### Core Principles That Guided Development
+
+#### 1. **Separation of Concerns**
+```
+DATA LAYER       → Load, parse, transform, cache
+BUSINESS LOGIC   → Filter, format, compute
+PRESENTATION     → Display, interact, visualize
+```
+
+**Why:** Each layer can be modified independently. Data changes don't break UI. UI redesign doesn't affect data processing.
+
+#### 2. **Performance Through Preprocessing**
+```
+Do expensive work ONCE at startup
+   ↓
+   Parse variants
+   Query API
+   Cache results
+   Format data
+   ↓
+User interactions are INSTANT
+```
+
+**Why:** Users don't wait for data processing during interactions. App feels responsive.
+
+#### 3. **Reactive Programming**
+```
+User changes filter
+   ↓ (automatic)
+Data re-filtered
+   ↓ (automatic)
+UI updates
+   ↓ (automatic)
+Tracks refresh
+```
+
+**Why:** No manual update logic. No bugs from forgetting to update something. Declarative code.
+
+#### 4. **Fail Gracefully**
+```
+Variant has no coordinate? → Skip it, continue
+API call fails? → Return NA, don't crash
+Filter removes all data? → Show empty track, explain
+```
+
+**Why:** Real-world data is messy. App should handle edge cases without breaking.
+
+#### 5. **Cache Everything Expensive**
+```
+Ensembl exon structure → Pre-built by svv_build_cache.R; loaded from disk (6-month expiry)
+ClinVar API calls      → Pre-built by svv_build_cache.R; loaded from disk (7-day expiry)
+Parsed data            → Computed once (session)
+Filtered data          → Reactive (auto-cached)
+```
+
+**Why:** Decoupling cache-building from app startup means the app launches in < 5 seconds regardless of network conditions. Single-call exon fetch + local arithmetic (in the cache builder) eliminates 143 per-coordinate API calls. Works fully offline between cache refreshes. Reduces external API load.
+
+---
+
+## Data Flow Diagram
+
+### Startup Sequence
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ APP STARTUP (Happens Once)                                          │
+└─────────────────────────────────────────────────────────────────────┘
+
+1. Load Libraries
+   ├─ shiny, igvShiny, dplyr, stringr, httr, jsonlite, shinyWidgets, readxl
+   └─ Why: Each provides specific functionality
+
+1B. Load ClinVar Data (from pre-built cache)
+   ├─ Read cache/clinvar/clinvar_data.rds from disk (< 1 ms)
+   ├─ If cache absent → warn and continue with empty data frame
+   └─ Cache is populated separately by svv_build_cache.R
+
+2. Load 2024 Citizen variant data (2024_citizen_variants.csv)
+   ├─ 153 variants × 33 columns; one row per unique variant
+   └─ stringsAsFactors = FALSE for flexibility
+
+3. Aggregate 2026 Citizen patient counts (2026_citizen_variants.xlsx)
+   ├─ Per-patient rows → table() → named integer vector (variant → count)
+   └─ Wrapped in tryCatch; missing file → 0 for all variants
+
+4. Aggregate CureSyngap1 patient counts (curesyngap1_variants.csv)
+   ├─ Per-patient rows → table() → named integer vector (variant → count)
+   └─ Wrapped in tryCatch; missing file → 0 for all variants
+
+5. Clean Variant Types
+   ├─ "missense VUS" → "missense-VUS"
+   ├─ "frameshift deletion" → "frameshift"
+   └─ Ensures consistent naming
+
+6. Extract cDNA Coordinates + Derive Count Columns
+   ├─ "c.333del" → 333
+   ├─ "c.190_200del" → 190
+   ├─ citizen_2026_count: lookup variant in 2026 counts table (0 if absent)
+   ├─ curesyngap1_count: lookup variant in CureSyngap1 counts table (0 if absent)
+   └─ Uses regex parsing + named table lookup
+
+7. Convert Coordinates to Genome Positions
+   ├─ Read transcript exon structure from cache/transcript_structure/ (< 1 ms)
+   ├─ If cache absent → warn; all positions will be NA
+   ├─ Compute all cDNA→genome mappings locally via arithmetic (~1 ms)
+   ├─ cDNA 333 → chr6:33,425,796
+   └─ No API calls at app launch (cache populated by svv_build_cache.R)
+
+8. Format Protein Changes
+   ├─ "p.R135X" → "Arg135ter"
+   └─ Three-letter codes more readable
+
+9. Merge Everything
+   ├─ Original data + coordinates + formatted names + source counts
+   └─ Complete dataset ready for visualization
+
+10. Start Web Server
+   ├─ Initialize UI
+   ├─ Initialize IGV browser
+   └─ Wait for user interaction
+
+svv_build_cache.R (run once before first launch): ~35–65 seconds (ClinVar fetch ~30–60 sec + exon structure fetch ~500 ms)
+Every app launch: < 5 seconds (reads both caches from disk; no API calls)
+```
+
+### User Interaction Sequence
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ USER INTERACTION (Reactive)                                         │
+└─────────────────────────────────────────────────────────────────────┘
+
+Scenario 1: User clicks "missense" button
+────────────────────────────────────────
+1. observeEvent fires
+2. Update added_tracks state (missense = TRUE)
+3. Get filtered_data() (respects any active filters)
+4. Filter for variant.type == "missense"
+5. Convert to GFF3 format
+6. Load track into IGV
+7. Center view on SYNGAP1 gene
+8. Track appears on screen
+9. If ClinVar track is active: repin_clinvar_to_bottom() removes and
+   re-adds the ClinVar track so it remains below all variant tracks
+
+Scenario 2: User clicks "ClinVar" button
+─────────────────────────────────────────
+1. observeEvent fires
+2. Set clinvar_track_added(TRUE)
+3. Read current slider value (input$clinvar_size_kb), default 100 KB
+4. Call create_clinvar_gff3_data(clinvar_data, max_size_kb = 100)
+   ├─ Filter out variants with no GRCh38 coordinates
+   ├─ Filter out variants whose span > 100 KB
+   └─ Format remaining variants as GFF3
+5. Load teal ClinVar track into IGV
+   └─ Because this is a fresh load (not triggered by a variant-type button),
+      ClinVar lands at the bottom of the current stack naturally
+6. Center view on SYNGAP1 gene
+7. Track appears on screen — pinned at the bottom
+
+Scenario 3: User moves ClinVar size slider to 10 KB
+──────────────────────────────────────────────────────
+1. observeEvent(input$clinvar_size_kb) fires
+2. Check clinvar_track_added() — TRUE, so continue
+3. Re-call create_clinvar_gff3_data(clinvar_data, max_size_kb = 10)
+   └─ Fewer variants pass the span filter
+4. Reload ClinVar track (replaces existing track, no flicker)
+5. Track updates instantly to show only variants ≤ 10 KB
+
+Scenario 4: User checks "Has biorepository samples"
+─────────────────────────────────────────────────────
+1. Checkbox input changes
+2. filtered_data() reactive recalculates
+   ├─ Start with all variants
+   ├─ Filter: biorepository column has data
+   └─ Return subset
+3. trackButtons UI regenerates (different variant types available)
+4. observeEvent for filtered_data() fires
+5. All visible internal tracks reload with filtered data
+6. IGV updates (some variants disappear)
+7. ClinVar track is unaffected by the filter (independent pipeline)
+8. Second observeEvent for filtered_data() fires: if ClinVar is active,
+   repin_clinvar_to_bottom() ensures it stays at the bottom after reloads
+
+Scenario 5: User checks "Cell line available" too
+──────────────────────────────────────────────────
+1. Second checkbox changes
+2. filtered_data() reactive recalculates again
+   ├─ Start with all variants
+   ├─ Filter: biorepository column has data (AND)
+   ├─ Filter: iPSC.line column has data (AND)
+   └─ Return smaller subset (intersection)
+3. Tracks reload with even fewer variants
+4. UI shows only variants with BOTH resources
+```
+
+---
+
+## Component Breakdown
+
+### Layer 1: Data Processing
+
+**Purpose:** Transform raw CSV into visualization-ready format; fetch and cache external reference data
+
+**Components:**
+
+1. **ClinVar Loader** (simple `readRDS` in `svv_app.R`)
+   - Input: `cache/clinvar/clinvar_data.rds` (pre-built by `svv_build_cache.R`)
+   - Output: `clinvar_data` data frame (~1,900 variants with GRCh38 coordinates)
+   - Cache builder: `fetch_clinvar_ids`, `fetch_clinvar_summaries`, `load_clinvar_data` in `svv_build_cache.R`
+   - Expiry: 7 days — re-run `svv_build_cache.R` to refresh
+
+2. **Amino Acid Converter** (`swap_one_letter_to_three_letter`)
+   - Input: `"R135X"`
+   - Output: `"Arg135ter"`
+   - Why: Readability for biologists
+
+3. **Coordinate Extractor** (`extract_cDNA_coordinate`)
+   - Input: `"c.333del"`
+   - Output: `333`
+   - Why: Need numeric value for local coordinate mapping
+
+4. **Transcript Exon Loader** (simple `readRDS` in `svv_app.R`)
+   - Input: `cache/transcript_structure/ENST00000418600.rds` (pre-built by `svv_build_cache.R`)
+   - Output: Data frame of exons sorted in transcript order (strand-aware)
+   - Cache builder: `fetch_transcript_exons` in `svv_build_cache.R` (single Ensembl API call replacing 143+ per-coordinate calls)
+   - Expiry: 6 months — re-run `svv_build_cache.R` to refresh
+
+5. **Local Coordinate Mapper** (`build_cdna_position_map`)
+   - Input: Vector of cDNA coordinates + exon data frame
+   - Output: Data frame with genome positions (seqid, start, end)
+   - Pure arithmetic — no network calls
+   - Why: cDNA→exon arithmetic is deterministic and matches Ensembl's own mapping exactly
+
+6. **Data Loader**
+   - Reads `2024_citizen_variants.csv` (153 variants; pre-aggregated patient counts)
+   - Aggregates per-variant counts from `2026_citizen_variants.xlsx` via `table()`
+   - Aggregates per-variant counts from `curesyngap1_variants.csv` via `table()`
+   - Normalizes variant types
+   - Extracts cDNA coordinates
+   - Joins source counts as `citizen_2026_count` and `curesyngap1_count` columns
+   - Maps to genome positions (locally)
+   - Merges results into complete dataset
+
+### Layer 2: User Interface
+
+**Purpose:** Visual layout and controls
+
+**Components:**
+
+1. **Title Bar**
+   - Shows app name
+   - Professional appearance
+
+2. **Sidebar Panel**
+   - Dynamic variant type buttons (generated by server)
+   - Three research asset filter checkboxes (above the ClinVar divider)
+   - Static ClinVar track button (below a divider)
+   - Log-spaced size filter slider for ClinVar (1–50,000 KB, default 100 KB)
+   - Compact width (30% of screen)
+
+3. **Main Panel**
+   - IGV browser widget
+   - Large display area (70% of screen)
+   - 700px height for multiple tracks
+
+4. **Footer**
+   - Citation for igvShiny tool
+   - Centered, small font
+
+**Layout Choice:**
+```
+┌────────────────────────────────────────┐
+│         SYNGAP1 Variant Viewer         │
+├──────────────┬─────────────────────────┤
+│              │                         │
+│  [missense]  │                         │
+│  [nonsense]  │      IGV Browser        │
+│  [frameshift]│      (Genome View)      │
+│  ...         │                         │
+│  □ Biorepository                       │
+│  □ Cell line │                         │
+│  □ Mouse line│                         │
+│ ──────────── │                         │
+│  [ClinVar]   │                         │
+│  |~~~size~~| │                         │
+│              │                         │
+└──────────────┴─────────────────────────┘
+  30% width         70% width
+```
+
+### Layer 3: Server Logic
+
+**Purpose:** Reactive programming that connects UI to data
+
+**Components:**
+
+1. **Internal Track State Manager** (`added_tracks`)
+   - Tracks which variant-type buttons user has clicked
+   - Persists across filter changes
+   - Type: `reactiveVal(list())`
+
+2. **ClinVar Track State Manager** (`clinvar_track_added`)
+   - Separate flag for whether the ClinVar track is currently displayed
+   - Prevents the size slider observer from firing before the track exists
+   - Type: `reactiveVal(FALSE)`
+
+3. **Data Filter** (`filtered_data`)
+   - Reactive expression
+   - Recomputes when any filter checkbox changes
+   - Returns: Subset of variant_data matching all active filters
+   - Note: Does not affect ClinVar data (independent reference dataset)
+
+4. **Button Generator** (`output$trackButtons`)
+   - Reactive UI
+   - Creates buttons based on filtered variant types
+   - Updates when filters change
+
+5. **Internal Track Loader** (`observe` with button events)
+   - Listens for variant-type button clicks
+   - Converts data to GFF3 format
+   - Loads track into IGV
+   - Handles empty data gracefully
+
+6. **ClinVar Track Loader** (`observeEvent(input$addTrack_clinvar)`)
+   - Listens for ClinVar button click
+   - Sets `clinvar_track_added(TRUE)`
+   - Calls `create_clinvar_gff3_data()` with current slider value
+   - Loads teal ClinVar track into IGV
+
+7. **ClinVar Size Slider Handler** (`observeEvent(input$clinvar_size_kb)`)
+   - Fires when user moves the size filter slider
+   - No-op if `clinvar_track_added()` is FALSE (track not yet displayed)
+   - Re-builds GFF3 with new KB threshold and reloads track live
+
+8. **Track Updater** (`observeEvent(filtered_data())`)
+   - Watches for filter changes
+   - Reloads all visible internal tracks with new filtered data
+   - Keeps display in sync with filters
+
+9. **IGV Initializer** (`output$igvShiny_0`)
+   - Sets up genome browser on startup
+   - Configures genome (hg38)
+   - Sets initial view (SYNGAP1)
+   - Starts with no tracks
+
+---
+
+## Key Design Decisions
+
+### Decision 1: When to Process Data?
+
+**Options:**
+- A) Process data when user requests it (lazy loading)
+- B) Process all data at startup (eager loading)
+
+**Chosen: B (Eager Loading)**
+
+**Rationale:**
+- Dataset is small (153 variants)
+- Startup delay acceptable (~1 second with cache)
+- User interactions must be instant
+- Simpler code (no loading states)
+- Better UX (no waiting during use)
+
+**Trade-off:** Longer startup vs instant interactions → Choose instant interactions
+
+---
+
+### Decision 2: How to Handle cDNA→Genome Coordinate Conversion?
+
+**Options:**
+- A) Query Ensembl `/map/cdna/` endpoint once per variant coordinate at startup (memoized)
+- B) Fetch the complete transcript exon structure once; compute all mappings locally
+
+**Chosen: B (Single exon-structure fetch + local arithmetic)**
+
+**Rationale:**
+- One API call replaces 143+ per-coordinate calls
+- Local arithmetic is deterministic and matches Ensembl's own mapping exactly
+- Cold-cache startup drops from ~8–12 minutes to under 30 seconds
+- Adding new variants to the CSV costs nothing at startup — exon table already cached
+- Exon structure for a stable transcript like ENST00000418600 changes rarely; 6-month cache is more than conservative
+
+**Trade-off:** Manual cache invalidation if Ensembl updates the annotation → mitigated by a 6-month time-based expiry that handles this automatically
+
+---
+
+### Decision 3: What Happens When Filters Remove All Data?
+
+**Options:**
+- A) Hide the track completely
+- B) Show empty track with message
+- C) Disable the button
+
+**Chosen: B (Show Empty Track)**
+
+**Rationale:**
+- User feedback (track exists, just filtered out)
+- Consistent behavior (all clicks do something)
+- Less confusing than disappearing tracks
+- Easy to understand why track is empty
+
+**Trade-off:** Visual clutter vs clarity → Choose clarity
+
+---
+
+### Decision 4: How to Structure Filter Logic?
+
+**Options:**
+- A) OR logic (any filter matches)
+- B) AND logic (all filters match)
+- C) Complex boolean logic
+
+**Chosen: B (AND Logic)**
+
+**Rationale:**
+- "Show variants with biorepository AND cell line"
+- Natural interpretation
+- Most useful for research planning
+- Simple to implement
+- Easy to explain to users
+
+**Trade-off:** Flexibility vs simplicity → Choose simplicity
+
+---
+
+### Decision 5: Where to Store Genome Positions?
+
+**Options:**
+- A) In CSV file
+- B) Query API each time
+- C) Cache in memory
+- D) Cache on disk permanently
+
+**Chosen: D (Disk Cache) with path to migrate to A**
+
+**Current Approach:**
+```
+CSV → Extract coords → Check cache → (API if needed) → Display
+```
+
+**Better Future Approach:**
+```
+Enhanced CSV (with positions) → Display
+```
+
+**Rationale:**
+- Current: Good enough, works now
+- Future: Simpler, faster, more reliable
+- Migration path: Extract cache → CSV → Remove API code
+
+---
+
+## Development Timeline (How the App Was Built)
+
+### Phase 1: Prototype (The "desktop" File)
+```
+Goal: Prove concept
+Approach: Hardcode everything
+Result: 160 hardcoded positions, single track
+Learning: IGV integration works!
+```
+
+**Code:**
+```r
+startPathogenic <- c(33420307, 33420332, ...)  # 160 positions
+loadBedTrack(..., tbl=tbl.pathogenic, color="red")
+```
+
+**Limitations:**
+- Can't add new variants without editing code
+- No filtering
+- No variant type distinction
+- Not maintainable
+
+### Phase 2: Data-Driven Design
+```
+Goal: Load from CSV
+Approach: Read 2024_citizen_variants.csv
+Result: Dynamic variant loading
+Learning: Need coordinate conversion!
+```
+
+**Challenge:** CSV has cDNA coordinates, IGV needs genome coordinates
+
+**Solution:** Ensembl REST API
+
+### Phase 3: API Integration
+```
+Goal: Convert coordinates automatically
+Approach: Query Ensembl API
+Result: Working but slow (40 seconds startup)
+Learning: Need caching!
+```
+
+**Problem:**
+```
+143 variants × 300ms per API call = 42,900ms = 43 seconds
+```
+
+**Unacceptable for production app**
+
+### Phase 4: Performance Optimization
+```
+Goal: Fast cold-cache startup (was 8–12 minutes)
+Approach: Fetch transcript exon structure once; compute all mappings locally
+Result: Cold-cache startup under 30 seconds; subsequent runs under 5 seconds
+Learning: Restructuring the problem (one fetch + arithmetic) beats caching many calls!
+```
+
+**The problem with per-coordinate memoization:**
+```
+143 variants × 300ms per API call = 42,900ms = ~43 seconds on cold cache
+Cache only helps after first build — if cache is absent or corrupted, full delay returns
+```
+
+**The new approach:**
+```r
+# Fetch the exon structure once
+transcript_exons <- fetch_transcript_exons("ENST00000418600")  # ~500 ms, 1 call
+
+# Map all coordinates locally with arithmetic — no further API calls
+positions_df <- build_cdna_position_map(
+  coords  = variant_data$cDNA_coordinate,
+  exon_df = transcript_exons
+)  # ~1 ms
+```
+
+**Performance:**
+```
+Before: 8–12 minutes (cold cache), ~2 seconds (warm cache)
+After:  ~30 seconds total (cold), <5 seconds (warm)
+Key insight: The exon table is the only data needed; per-coordinate API calls were redundant
+```
+
+### Phase 5: Rich UI Features
+```
+Goal: Multiple variant types, filtering
+Approach: Dynamic buttons, reactive filters
+Result: Professional research tool
+Learning: Reactive programming is powerful!
+```
+
+**Added:**
+- Color-coded variant types
+- Dynamic button generation
+- Research asset filters
+- Graceful empty state handling
+- Track updates on filter changes
+
+### Phase 6: Polish & Documentation
+```
+Goal: Production-ready code
+Approach: Comments, error handling, citation
+Result: Maintainable, documented application
+Learning: Documentation is essential!
+```
+
+### Phase 7: ClinVar Integration & Size Filter
+```
+Goal: Add live ClinVar reference data alongside internal variants
+Approach: NCBI E-utilities API with time-limited cache
+Result: Toggleable ClinVar track with log-spaced size filter slider
+Learning: Two caches with different lifetimes need different strategies!
+```
+
+**Added:**
+- ClinVar fetch via NCBI esearch + esummary (batched, rate-limited) — in `svv_build_cache.R`
+- 7-day time-limited cache (`cache/clinvar/`) with stale-cache fallback — managed by `svv_build_cache.R`
+- `create_clinvar_gff3_data()` with `max_size_kb` parameter — in `svv_app.R`
+- Static ClinVar button (separate from dynamic variant-type loop)
+- `clinvar_track_added` state flag to gate the slider observer
+- `shinyWidgets::sliderTextInput()` with log-spaced stops (1–50,000 KB)
+- Live track reload on slider change
+
+### Phase 8: Cold-Cache Startup Optimization
+```
+Goal: Eliminate 8–12 minute cold-cache delay
+Problem: Per-coordinate Ensembl API calls via memoise were O(N) at startup
+Approach: Fetch transcript exon structure once; compute all mappings locally
+Result: Cold-cache startup under 30 seconds; warm-cache startup unchanged
+```
+
+**Root cause:**
+```
+143 unique cDNA coordinates × ~300ms per /map/cdna/ call = ~43 seconds (Ensembl only)
+memoise permanent cache helped warm starts, but cold-cache was still O(N) API calls
+```
+
+**Architectural change:**
+- Replaced `get_genome_positions_function` + `memoise` + `cachem::cache_disk` with:
+  - `fetch_transcript_exons()` — one call, returns full exon table
+  - `build_cdna_position_map()` — pure arithmetic, no network
+  - `transcript_cache_is_fresh()` / `write_transcript_cache()` — 6-month time-based expiry
+- Removed `memoise` and `cachem` package dependencies
+- Old approach preserved on the `slow-cache-option` branch
+
+### Phase 9: UI Polish & ClinVar Track Pinning
+```
+Goal: Improve sidebar clarity and ClinVar track positioning
+Changes: Three targeted UI fixes — no data pipeline or API changes
+```
+
+**Changes made:**
+
+- **Sidebar reorder**: Research asset filter checkboxes (biorepository, cell line, mouse line)
+  moved above the horizontal `hr()` separator so all internal-data controls are visually
+  grouped together. The ClinVar button and size slider remain below the separator as the
+  clearly distinct external-reference section.
+
+- **Track label rename**: The `missense-VUS` button now displays as **"VUS (missense only)"**.
+  The internal variant type identifier (`missense-VUS`) used throughout the data pipeline,
+  GFF3 formatting, color table, and `observeEvent` observers is unchanged — only the
+  `actionButton` label rendered in the sidebar is affected, via a `track_label_map` lookup
+  in `output$trackButtons`. A factor-to-character coercion (`as.character(type)`) is applied
+  before the lookup to avoid `[[` treating factor levels as integer indices.
+
+- **ClinVar bottom-pinning**: Added `repin_clinvar_to_bottom()` helper (Section 9C) that
+  calls `removeTracksByName()` followed by `loadGFF3TrackFromLocalData()` for the ClinVar
+  track, forcing IGV to re-append it at the bottom of the stack. Called in two places:
+  1. Inside the variant-type button `observeEvent`, after each new track load.
+  2. In a dedicated `observeEvent(filtered_data())` observer, after filter-driven track
+     reloads complete.
+
+### Phase 10: Feature Popup Size Field
+```
+Goal: Surface genomic span directly in the variant click popup
+Changes: GFF3 attributes extended in create_gff3_data() and create_clinvar_gff3_data()
+```
+
+**Changes made:**
+
+- **`create_gff3_data()` (Section 9)**: Added `Size` as the final attribute in both branches
+  of the `ifelse` that builds the attributes string. Computed as `end - start` from the GFF3
+  columns already present in the `mutate` block — no new data sources required. Displayed as
+  bp for variants < 1,000 bp, or kb (rounded to 2 decimal places) for variants ≥ 1,000 bp.
+
+- **`create_clinvar_gff3_data()` (Section 9B)**: Added `Size` as the final attribute after
+  `OncogenicityReviewStatus`. ClinVar spans a far wider range than internal variants (SNVs
+  through multi-megabase CNVs), so a three-tier display is used: Mb (≥ 1,000,000 bp), kb
+  (≥ 1,000 bp), or bp. The `clean_attr()` sanitizer is intentionally skipped here since the
+  value is computed arithmetic, not a raw ClinVar string that could contain GFF3 reserved
+  characters (`;` or `=`).
+
+**Why not in a separate column?**
+  GFF3 carries all display metadata in the attributes string; IGV reads key=value pairs from
+  that field to populate the feature detail popup. Adding a dedicated column would break the
+  GFF3 format expected by `loadGFF3TrackFromLocalData()`.
+
+### Phase 11: Cache-Builder Separation
+```
+Goal: Decouple external API calls from Shiny app startup
+Changes: Cache-building code moved from svv_app.R into standalone svv_build_cache.R
+```
+
+**Changes made:**
+
+- `svv_build_cache.R` is now the **canonical** home for all cache-building logic: ClinVar
+  E-utilities fetch functions (`fetch_clinvar_ids`, `fetch_clinvar_summaries`,
+  `load_clinvar_data`) and the Ensembl transcript fetch (`fetch_transcript_exons`,
+  `write_transcript_cache`, `transcript_cache_is_fresh`).
+
+- `svv_app.R` now contains only two simple `readRDS` stubs — one for `clinvar_data` and
+  one for `transcript_exons` — with graceful empty-frame / NULL fallbacks if the cache
+  files are absent.
+
+- `library(httr)` and `library(jsonlite)` removed from `svv_app.R` (no longer needed;
+  retained in `svv_build_cache.R` which still makes HTTP requests).
+
+**Why:**
+  Running the app no longer requires outbound network access at launch time. The Shiny
+  process simply reads from disk, making startup faster and more predictable in restricted
+  network environments. `svv_build_cache.R` can be run on a schedule (cron, GitHub Actions)
+  or manually to keep the caches fresh.
+
+### Phase 12: Single-Base Variant Size Fix
+```
+Goal: Correct "0 bp" Size display for point variants in the feature popup
+Change: Floor the size calculation to 1 bp in create_gff3_data() and
+        create_clinvar_gff3_data()
+```
+
+**Root cause:**
+
+Both `create_gff3_data()` and `create_clinvar_gff3_data()` compute genomic span as
+`end - start` (or `clinvar_end - clinvar_start`). For single-base variants (SNVs,
+single-base deletions, frameshifts, etc.) the `start` and `end` coordinates are
+identical, so the subtraction evaluates to `0`, producing "0 bp" in the popup.
+
+For ClinVar specifically, this was a latent consequence of the v3.0.1 fix: removing the
+`+1` end-coordinate offset from `parse_esummary_record` was correct for IGV rendering,
+but it meant that SNVs — which arrive from NCBI with `start == stop` — now also produce
+`clinvar_end - clinvar_start == 0` in the size field.
+
+**Fix:**
+
+Replaced all raw difference expressions with `pmax(..., 1L)` — R's vectorized
+element-wise maximum — so each row's size floors at 1 bp without affecting multi-base
+variants whose span is already ≥ 1.
+
+*Internal variants (`create_gff3_data()`)* — applied to both branches of the
+`attributes` `ifelse` (no-protein-change and has-protein-change):
+
+```r
+# Before
+";Size=", ifelse(
+  (end - start) >= 1000,
+  paste0(round((end - start) / 1000, 2), " kb"),
+  paste0(end - start, " bp")
+)
+
+# After
+";Size=", ifelse(
+  pmax(end - start, 1L) >= 1000,
+  paste0(round(pmax(end - start, 1L) / 1000, 2), " kb"),
+  paste0(pmax(end - start, 1L), " bp")
+)
+```
+
+*ClinVar variants (`create_clinvar_gff3_data()`)* — applied across all three tiers of
+the nested `ifelse` (Mb / kb / bp):
+
+```r
+# Before
+";Size=", ifelse(
+  (clinvar_end - clinvar_start) >= 1e6,
+  paste0(round((clinvar_end - clinvar_start) / 1e6, 2), " Mb"),
+  ifelse(
+    (clinvar_end - clinvar_start) >= 1000,
+    paste0(round((clinvar_end - clinvar_start) / 1000, 2), " kb"),
+    paste0(clinvar_end - clinvar_start, " bp")
+  )
+)
+
+# After
+";Size=", ifelse(
+  pmax(clinvar_end - clinvar_start, 1L) >= 1e6,
+  paste0(round(pmax(clinvar_end - clinvar_start, 1L) / 1e6, 2), " Mb"),
+  ifelse(
+    pmax(clinvar_end - clinvar_start, 1L) >= 1000,
+    paste0(round(pmax(clinvar_end - clinvar_start, 1L) / 1000, 2), " kb"),
+    paste0(pmax(clinvar_end - clinvar_start, 1L), " bp")
+  )
+)
+```
+
+**No changes to:** UI, filters, data pipeline, or caches. No cache invalidation required.
+
+### Phase 13: Multi-Source Patient Count Display & File Renaming
+```
+Goal: Show per-database patient counts in the variant popup
+Problem: Single "Number of patients" field gave no source context
+Approach: Load two additional per-patient-row files; aggregate counts at startup
+Result: Variant popup now shows 2024 Citizen Count, 2026 Citizen Count,
+        and CureSyngap1 Survey Count as three separate fields
+```
+
+**New data sources:**
+
+| File | Format | Count derivation |
+|---|---|---|
+| `2024_citizen_variants.csv` | One row per unique variant | Pre-aggregated in `X..patients.in.Citizen.Health` column |
+| `2026_citizen_variants.xlsx` | One row per patient | `table(raw$variant)` at startup |
+| `curesyngap1_variants.csv` | One row per patient | `table(raw$variant)` at startup |
+
+**Key implementation decisions:**
+
+- Files kept **separate** rather than merged into one CSV — preserves data provenance, allows each source to be updated independently, and avoids the awkward "mixed-grain" problem (the 2024 file is pre-aggregated; the other two are per-patient)
+- Both new loaders wrapped in `tryCatch` — a missing file produces `0` counts for that source instead of crashing the app
+- Count columns added to `variant_data` during the existing `mutate()` preprocessing block so they are available everywhere downstream without restructuring any other code
+- `create_gff3_data()` attributes string updated in both branches (`ifelse`) — no change to the GFF3 column structure, only the content of the attributes field
+- Added `library(readxl)` for `.xlsx` reading; `svv_packages.R` updated to install and verify it
+
+**Files renamed for clarity:**
+- `updatedCitizen191.csv` → `2024_citizen_variants.csv`
+- `curesyngap1_variants_clean.csv` → `curesyngap1_variants.csv`
+
+No changes to coordinate mapping, ClinVar integration, filters, UI layout, or caches.
+
+### Pattern 1: Single-Fetch + Local Arithmetic for Coordinate Mapping
+```r
+# Fetch the data structure once (1 API call)
+transcript_exons <- fetch_transcript_exons("ENST00000418600")
+
+# Compute all derived values locally — no further network calls
+positions_df <- build_cdna_position_map(
+  coords  = variant_data$cDNA_coordinate,
+  exon_df = transcript_exons
+)
+```
+
+**Why this beats per-call caching:**
+- Cold cache: 1 API call (~500 ms) instead of 143 calls (~43 seconds)
+- Adding variants to the CSV costs nothing — exon table already covers the whole transcript
+- The arithmetic is deterministic; results are identical to per-coordinate API queries
+- Cache stores one compact file (the exon table) instead of hundreds of individual hash files
+
+**When to use:** Any situation where you need to compute many derived values from a single stable data structure
+
+---
+
+### Pattern 2: Reactive Expression for Derived Data
+```r
+# Reactive expression (automatically updates)
+filtered_data <- reactive({
+  data <- original_data
+  if (input$checkbox) {
+    data <- data %>% filter(...)
+  }
+  data
+})
+
+# Use in outputs/observers
+output$plot <- renderPlot({
+  plot(filtered_data())  # Auto-updates when checkbox changes
+})
+```
+
+**When to use:** Data that depends on user inputs and is used in multiple places
+
+---
+
+### Pattern 3: Closure to Avoid Variable Capture
+```r
+# WRONG - all observers share same 'type'
+for (type in types) {
+  observeEvent(input[[type]], {
+    print(type)  # Always prints last type!
+  })
+}
+
+# RIGHT - each observer gets own 't'
+for (type in types) {
+  local({
+    t <- type  # Capture in local scope
+    observeEvent(input[[t]], {
+      print(t)  # Prints correct type
+    })
+  })
+}
+```
+
+**When to use:** Observers in loops
+
+---
+
+### Pattern 4: Graceful Degradation
+```r
+result <- tryCatch({
+  expensive_operation()
+}, error = function(e) {
+  # Return sensible default instead of crashing
+  return(list(seqid = "chr6", start = NA, end = NA))
+})
+```
+
+**When to use:** External dependencies, network calls, user data
+
+---
+
+### Pattern 5: Separate Validation from Processing
+```r
+# Validation wrapper
+extract_protein_change <- function(protein_change) {
+  if (is.na(protein_change) || protein_change == "") {
+    return(protein_change)  # Handle bad input
+  }
+  swap_one_letter_to_three_letter(protein_change)  # Do work
+}
+
+# Processing function (assumes valid input)
+swap_one_letter_to_three_letter <- function(protein_change_str) {
+  # No validation needed - wrapper handles it
+  # Pure transformation logic
+}
+```
+
+**When to use:** Complex data transformations with edge cases
+
+---
+
+## Summary: The Full Picture
+
+```
+                    SYNGAP1 Variant Viewer
+                           ↓
+        ┌──────────────────┴──────────────────┐
+        │                                     │
+    DATA LAYER                           UI LAYER
+        │                                     │
+   Load CSV ────────────────────────→  Display Controls
+   Parse Variants                       Show IGV Browser
+   Query Ensembl (cached!) ←────────  User Clicks Button
+   Fetch ClinVar (7-day cache!)         User Checks Filter
+   Format Data              ←────────  User Moves Slider
+        │                                     │
+        └──────────────────┬──────────────────┘
+                           ↓
+                    REACTIVE LAYER
+                   (Shiny Server)
+                           │
+        ┌──────────────────┼──────────────────┐
+        │                  │                  │
+   Filter Data      Generate UI        Load Tracks
+   (reactive())   (renderUI())    (observeEvent())
+        │                  │                  │
+        │                  │       ┌──────────┴──────────┐
+        │                  │  Internal tracks       ClinVar track
+        │                  │  (filtered by          (filtered by
+        │                  │   checkboxes)           size slider)
+        └──────────────────┴──────────────────┘
+                           ↓
+                    User sees updated view
+                    (tracks, filters, data)
+```
+
+**Key Insight:** 
+The app maintains two parallel data pipelines. Both rely on pre-built disk caches (populated by `svv_build_cache.R`): internal variant data flows from three CSV/Excel sources → cached exon structure (readRDS) → local cDNA arithmetic → reactive filter → GFF3 → IGV, while ClinVar data flows from cached clinvar_data.rds (readRDS) → size filter → GFF3 → IGV. Both pipelines share the same IGV browser but are controlled independently — internal tracks respond to research-asset checkboxes, while the ClinVar track responds only to its own button and size slider. Neither pipeline makes outbound API calls at app launch.
+
+**Success Criteria:**
+✅ Fast (< 1 second load time after first run)
+✅ Reliable (handles missing data gracefully)
+✅ Useful (filters help researchers find variants)
+✅ Maintainable (well-documented, modular code)
+✅ Scalable (can handle more variants/filters)
+
+---
+
+## Next Steps for Understanding
+
+1. **Read the commented code** (`svv_app.R`)
+   - Start at top, read section by section
+   - Each function has detailed explanation
+
+2. **Run the app** and watch the console
+   - See API calls on first run
+   - Notice instant load on second run
+   - Try filters, observe reactive updates
+
+3. **Experiment with modifications**
+   - Add a new filter
+   - Change color scheme
+   - Add a download button
+
+4. **Study the reactive flow**
+   - Open RStudio debugger
+   - Set breakpoints in observers
+   - Watch values change as you interact
+
+5. **Review design decisions**
+   - Understand why each choice was made
+   - Consider alternatives
+   - Think about trade-offs
+
+Good luck! 🧬

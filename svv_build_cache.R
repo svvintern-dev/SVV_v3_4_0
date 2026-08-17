@@ -18,9 +18,9 @@
 #         Source: Ensembl REST API                                             #
 #         Expiry: 6 months (180 days)                                          #
 #                                                                              #
-#  Compatible with: svv_app.R v3.2.0+                                          #
+#  Compatible with: app.R v3.2.0+                                          #
 #  Note: As of v3.2.0 these functions are maintained solely here; they are no  #
-#        longer duplicated in svv_app.R.                                        #
+#        longer duplicated in app.R.                                        #
 #                                                                              #
 #  Usage:                                                                      #
 #    Rscript svv_build_cache.R          # from terminal                        #
@@ -44,7 +44,7 @@ library(jsonlite)
 
 ################################################################################
 # SECTION 2: CLINVAR CONSTANTS
-# ClinVar cache constants (also read by svv_app.R via CLINVAR_CACHE_RDS)
+# ClinVar cache constants (also read by app.R via CLINVAR_CACHE_RDS)
 ################################################################################
 
 CLINVAR_CACHE_RDS       <- "cache/clinvar/clinvar_data.rds"
@@ -56,7 +56,7 @@ NCBI_BASE               <- "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 
 ################################################################################
 # SECTION 3: TRANSCRIPT CONSTANTS
-# Transcript cache constants (also read by svv_app.R via TRANSCRIPT_CACHE_FILE)
+# Transcript cache constants (also read by app.R via TRANSCRIPT_CACHE_FILE)
 ################################################################################
 
 TRANSCRIPT_ID          <- "ENST00000418600"
@@ -210,7 +210,7 @@ parse_esummary_record <- function(rec) {
         start38 <- suppressWarnings(as.numeric(safe(loc$start)))
         end38   <- suppressWarnings(as.numeric(safe(loc$stop)))
         # Note: start == stop for single-base variants; no +1 offset applied.
-        # (Bug fixed v3.0.1 — see svv_app.R parse_esummary_record comments)
+        # (Bug fixed v3.0.1 — see app.R parse_esummary_record comments)
         break
       }
     }
@@ -450,7 +450,7 @@ transcript_cache_is_fresh <- function() {
 ################################################################################
 # SECTION 6: MAIN — BUILD BOTH CACHES WITH DIAGNOSTIC REPORTING
 #
-# This section mirrors the startup execution blocks from svv_app.R but wraps
+# This section mirrors the startup execution blocks from app.R but wraps
 # each step in explicit [OK] / [WARN] / [FAIL] reporting so the output is
 # readable at a glance, whether run interactively or piped to a log file.
 ################################################################################

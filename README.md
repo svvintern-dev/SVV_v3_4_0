@@ -138,10 +138,10 @@ re-run it when you want to force a refresh before the automatic expiry windows
 
 ```r
 # In R console
-shiny::runApp("svv_app.R")
+shiny::runApp("app.R")
 
 # Or in RStudio
-# Open svv_app.R and click "Run App" button
+# Open app.R and click "Run App" button
 ```
 
 The app will open in your default web browser. With warm caches the app starts
@@ -155,7 +155,7 @@ in under 5 seconds and makes no outbound API calls at launch.
 
 1. Ensure all dependencies are installed (run `svv_packages.R` if needed)
 2. Ensure caches are populated (run `svv_build_cache.R` if not already done)
-3. Run: `shiny::runApp("svv_app.R")`
+3. Run: `shiny::runApp("app.R")`
 3. The app opens in your web browser at `http://localhost:XXXX`
 
 ### Basic Workflow
@@ -503,7 +503,7 @@ color_table <- list(
 
 Currently configured for **hg38**. To switch to hg19:
 
-1. Update `genomeName = "hg19"` in the `renderIgvShiny` block (~line 1385 in `svv_app.R`)
+1. Update `genomeName = "hg19"` in the `renderIgvShiny` block (~line 1385 in `app.R`)
 2. Clear transcript cache: `unlink("cache/transcript_structure/", recursive = TRUE)`
 3. Restart app (will re-fetch exon structure and remap coordinates for the new build)
 
@@ -514,7 +514,7 @@ Note: The ClinVar GRCh38 coordinate filter in `create_clinvar_gff3_data` would a
 Currently uses **ENST00000418600** (SYNGAP1 canonical transcript).
 
 To change:
-1. Update the transcript ID in `fetch_transcript_exons()` (in `svv_build_cache.R`) and the `TRANSCRIPT_CACHE_FILE` constant (~line 449 in `svv_app.R`)
+1. Update the transcript ID in `fetch_transcript_exons()` (in `svv_build_cache.R`) and the `TRANSCRIPT_CACHE_FILE` constant (~line 449 in `app.R`)
 2. Clear transcript cache: `unlink("cache/transcript_structure/", recursive = TRUE)`
 3. Restart app — it will fetch the exon structure for the new transcript and remap all coordinates
 
@@ -608,12 +608,12 @@ Enable console logging to track API calls:
 - `"Ensembl: retrieved X exons (strand -1)"` — exon structure ready
 - `"[OK]   Transcript exon structure fetched and cached: X exons"` — cache written successfully
 
-**`svv_app.R` console output** (at each app launch):
+**`app.R` console output** (at each app launch):
 - `"ClinVar: loading from cache..."` — cache present and loaded
 - `"Loading transcript exon structure from cache..."` — cache present and loaded
 - `"cDNA coordinate X is out of transcript range..."` — coordinate exceeds transcript length (expected for some structural variants)
 
-**`svv_app.R` warnings to watch for** (indicate missing cache — run `svv_build_cache.R`):
+**`app.R` warnings to watch for** (indicate missing cache — run `svv_build_cache.R`):
 - `"ClinVar cache not found..."` — ClinVar track will be empty this session
 - `"Transcript cache not found..."` — all genome positions will be NA this session
 

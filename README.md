@@ -699,6 +699,7 @@ doi: 10.1093/nar/gkab1112
 
 ### Contributors
 
+- Ahmad Bishara
 - Collin McNeil
 - Chloe Kaufman
 
